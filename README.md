@@ -1,195 +1,127 @@
-# Event Booking System (Spring Boot)
+Event Booking System (Backend)
 
-Backend APIs for an event booking platform with two roles (**ORGANIZER**, **CUSTOMER**), real e-mail
-notifications through a background job queue, and a documented stress-test / optimization journey.
+Backend APIs for an event booking platform with two roles: Event Organizers (create and manage events) and Customers (browse events and book tickets). Access is controlled by role. Booking confirmation and event-update emails are sent by a background job queue.
 
-- **Live API:** `<DEPLOYED_URL>` | **Swagger UI:** `<DEPLOYED_URL>/swagger-ui.html`
-- **Demo video:** `<LOOM_LINK>`
+Live (optimized): https://<optimized-url>.onrender.com
+Live (naive baseline): https://eventbooking-naive.onrender.com
+API docs (Swagger): https://<optimized-url>.onrender.com/swagger-ui.html
+Demo video: <video-link>
+Tech stack
+Area	Choice
+Language / framework	Java, Spring Boot
+Auth	Spring Security + JWT, role-based access (ORGANIZER, CUSTOMER)
+Persistence	Spring Data JPA / Hibernate, PostgreSQL (Neon)
+Background tasks	Database-backed job queue (outbox pattern) with a worker
+Email	Resend (HTTP API); a simulated provider is used for load tests
+Deployment	Render (two services: naive and optimized), Neon Postgres
+Load testing	k6
+Roles and access
+Action	Organizer	Customer
+Create / update / delete own events	Yes	403
+Browse events (paginated)	Yes	Yes
+Book tickets	403	Yes
+View / cancel own bookings	No	Yes
 
----
+Authentication uses a JWT in the Authorization: Bearer <token> header. The role is checked on every protected endpoint.
 
-## 1. Tech choices and why
+Main APIs
 
-| Concern            | Choice                                       | Why                                                                                                       |
-| ------------------ | -------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| Language/Framework | Java 21, Spring Boot 3.3                     | Familiar stack; Java 21 gives virtual threads for I/O-heavy endpoints                                     |
-| Database           | PostgreSQL + Flyway                          | Row-level locking, `SKIP LOCKED`, `CHECK` constraints. Flyway makes the schema reproducible               |
-| Auth               | Stateless JWT (HS256) + BCrypt               | No server session, no DB lookup per request (claims carry id/role)                                        |
-| Background jobs    | **Postgres outbox table + scheduled worker** | See §6. No extra infra to deploy, and the job is written in the _same transaction_ as the business change |
-| Email              | Resend HTTP API                              | Free hosts (Render etc.) block outbound SMTP ports; HTTP works everywhere                                 |
-| Load testing       | k6                                           | Arrival-rate executor shows _dropped iterations_ clearly                                                  |
-| Deploy             | Docker on Render + managed Postgres          | Free tier                                                                                                 |
+Adjust paths to match the controllers in this repo.
 
-Alternatives considered for the queue: RabbitMQ, Kafka, Redis + BullMQ/Redisson, SQS. All are more scalable
-but add infrastructure, and none give "job committed atomically with the booking" without an outbox anyway.
-`@Async` was rejected because jobs vanish on crash/restart.
+Method	Path	Role	Description
+POST	/api/auth/register	Public	Register a user with a role
+POST	/api/auth/login	Public	Log in, returns a JWT
+POST	/api/events	Organizer	Create an event
+PUT	/api/events/{id}	Organizer	Update an event (triggers notifications)
+GET	/api/events	Any	List events (pagination)
+POST	/api/events/{id}/bookings	Customer	Book tickets (optional Idempotency-Key header)
+GET	/api/bookings/mine	Customer	List my bookings
+DELETE / POST	cancel booking	Customer	Cancel a booking, seats are returned
+Background tasks
+Booking confirmation: when a booking succeeds, a BOOKING_CONFIRMATION job is inserted. A worker sends a real email through Resend.
+Event update notification: when an event is updated, jobs are created to email every customer who booked that event.
 
-## 2. Data model
+Design decisions:
 
-```
-users(id, name, email UNIQUE, password_hash, role, created_at)
-events(id, organizer_id FK, title, description, venue, start_time, total_seats, available_seats,
-       price, status ACTIVE|CANCELLED, created_at, updated_at,
-       CHECK (available_seats >= 0 AND available_seats <= total_seats))
-bookings(id, event_id FK, customer_id FK, quantity, status, idempotency_key UNIQUE, email_sent, created_at)
-jobs(id, type, payload, status PENDING|PROCESSING|DONE|FAILED, attempts, run_at, last_error,
-     locked_at, finished_at, created_at)
-```
+Outbox pattern. The job row is inserted in the same database transaction as the booking, so a job exists if and only if the booking was committed. A crash can't lose an email or send one for a booking that rolled back.
+Worker with retries. Jobs track status, attempts and last_error, so failures are visible and retried.
+No external call inside the booking transaction. The request only writes to the database. The slow email call happens in the worker.
+Provider switch. MAIL_PROVIDER=resend|simulated. Resend is used for the real demo. The simulated provider (with fixed latency) is used for load tests so they don't use up the email quota or send mail to fake addresses.
+Key design decisions
+Atomic seat decrement. The optimized booking uses one SQL statement that checks and decrements in the same step: UPDATE events SET available_seats = available_seats - :qty WHERE id = :id AND available_seats >= :qty. If 0 rows are updated, the event is sold out (or not found / inactive). This prevents overselling.
+Idempotency key. A client retry with the same Idempotency-Key returns the original booking instead of booking twice. Reusing a key for a different customer or event returns a conflict.
+Naive vs optimized in one codebase. app.mode=naive|optimized selects bookNaive or bookOptimized, so the same code base is deployed twice and compared under the same test.
+Pagination on event listing, and indexes on booking lookups.
+Seed endpoint for load tests (POST /api/admin/seed). It is protected by SEED_ENABLED and a secret header. It creates 1 organizer, 1,000 customers with one shared pre-computed BCrypt hash, an event with 100,000 seats, and a JWT for each customer. This way the load test measures booking only, not password hashing at login. It is disabled after testing.
+Performance testing
 
-Indexes: `events(start_time)`, `events(status,start_time)`, `events(organizer_id)`, `bookings(event_id)`,
-`bookings(customer_id)`, partial index `jobs(run_at,id) WHERE status='PENDING'` (worker only scans pending rows).
-Entities hold plain FK ids (no JPA relations) to avoid N+1 queries and lazy-loading surprises.
+Scenario: 1,000 customers book tickets for the same event while the request rate ramps up (k6 ramping-arrival-rate, up to about 80 requests/second at SCALE=0.1). The event has 100,000 seats so the test measures speed, not sell-outs. Thresholds: error rate under 1%, p95 latency under 1s, no dropped iterations.
 
-## 3. API
+Run:
 
-| Method | Endpoint                                                                 | Role                   |
-| ------ | ------------------------------------------------------------------------ | ---------------------- |
-| POST   | `/api/auth/register` `{name,email,password,role}`                        | public                 |
-| POST   | `/api/auth/login`                                                        | public                 |
-| POST   | `/api/events`                                                            | ORGANIZER              |
-| PUT    | `/api/events/{id}`                                                       | ORGANIZER (owner only) |
-| DELETE | `/api/events/{id}` (soft-cancel, notifies customers)                     | ORGANIZER (owner only) |
-| GET    | `/api/events/mine`                                                       | ORGANIZER              |
-| GET    | `/api/events/{id}/bookings`                                              | ORGANIZER (owner only) |
-| GET    | `/api/events?page=&size=`                                                | any authenticated      |
-| GET    | `/api/events/{id}`                                                       | any authenticated      |
-| POST   | `/api/events/{id}/book` `{quantity}` + optional `Idempotency-Key` header | CUSTOMER               |
-| GET    | `/api/bookings/mine`                                                     | CUSTOMER               |
-| DELETE | `/api/bookings/{id}`                                                     | CUSTOMER (owner only)  |
-| GET    | `/actuator/health`                                                       | public                 |
+copy seed-<naive|opt>.json k6\seed.json
+k6 run -e BASE=https://<service-url> -e SCALE=0.1 k6/booking-hot.js
+1. Initial (naive) implementation
+Metric (80 req/s ramp)	Result
+Successful bookings/sec	~8
+Failed requests	~46% (30s timeouts)
+Dropped iterations	666
+p95 latency	30s
 
-Status codes: 201 created, 400 validation, 401 no/invalid token, 403 wrong role or not owner,
-404, 409 sold out / conflict, 503 server saturated (DB pool timeout).
+Correctness: 2,781 tickets were booked but the event's seat count dropped by only 363. This is a lost update: concurrent requests read the same seat count and overwrite each other, so the system would oversell.
 
-```bash
-curl -X POST $BASE/api/auth/register -H 'Content-Type: application/json' \
-  -d '{"name":"Org","email":"org@x.com","password":"secret123","role":"ORGANIZER"}'
-curl -X POST $BASE/api/events -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"title":"Rock Night","venue":"Arena","startTime":"2030-01-01T18:00:00Z","totalSeats":100,"price":25}'
-curl -X POST $BASE/api/events/1/book -H "Authorization: Bearer $CUSTOMER_TOKEN" \
-  -H 'Content-Type: application/json' -H 'Idempotency-Key: abc-123' -d '{"quantity":2}'
-```
+Problems found in bookNaive:
 
-## 4. Auth and RBAC
+The confirmation email was sent inside the database transaction, so each request held a DB connection during a slow external call and the connection pool was exhausted.
+Seats were updated with read, modify, write, causing lost updates.
+About 6 database operations per booking.
+2. Optimizations
+Atomic UPDATE for the seat decrement (check and decrement in one statement).
+Email moved out of the request into the job queue (outbox pattern).
+Booking reduced to 3 database operations: UPDATE seats, INSERT booking, INSERT job.
+3. Final result
+	Naive	Optimized
+Seat count correct after load	No (363 decremented vs 2,781 booked)	Yes (2,745 = 2,745)
+Email inside the request	Yes	No (background worker)
+DB operations per booking	~6	3
+Highest load passing thresholds	___ req/s	___ req/s
 
-- `JwtAuthFilter` validates the signature and builds the principal from claims only (no DB hit).
-- `@EnableMethodSecurity` + `@PreAuthorize("hasRole('ORGANIZER')")` / `('CUSTOMER')` on controller methods.
-- **Ownership** is checked in the service layer (an organizer can only update/cancel/see bookings of _their own_ events).
-- Role is chosen at registration (as the task allows). In production, organizer sign-up would need approval.
-- BCrypt is never on the booking path; load tests use pre-signed JWTs from the seed endpoint.
+Fill in the last row from your lower-load runs (SCALE=0.02, 0.05). At SCALE=0.1 (about 80 req/s) both versions fail the thresholds on the free tier, and the throughput of the two was close (roughly 5-8 successful bookings/sec for naive, about 6 for optimized). The clear, proven improvement is correctness and removing the email from the request path.
 
-## 5. Concurrency strategy for booking
+Limits and next steps
+Every booking for one event updates the same database row, so a single event has a throughput ceiling, and the row lock is held for several database round trips.
+Both services run on free tiers (limited CPU, cold starts, network latency between Render and Neon), so absolute numbers are modest. The comparison matters, not the absolute value.
+Next steps:
+Take the row lock as late as possible in the transaction.
+Run the app and the database in the same region.
+Split seats into buckets, or use a Redis counter with asynchronous persistence.
+Add a queue-based booking flow (accept, then confirm) for very hot events.
+Environment variables
+Variable	Purpose
+DATABASE_URL / datasource settings	Neon Postgres connection
+APP_MODE	naive or optimized (maps to app.mode)
+JWT_SECRET	JWT signing key
+MAIL_PROVIDER	resend or simulated (default simulated)
+RESEND_API_KEY	Resend API key (never commit this)
+MAIL_FROM	Sender, default onboarding@resend.dev
+MAIL_SIM_LATENCY_MS	Latency of the simulated provider
+SEED_ENABLED	true only while load testing
+SEED_SECRET	Secret for the seed endpoint
 
-**v1 (naive, `APP_MODE=naive`)**: load event, check `available_seats`, subtract in Java, save, insert booking,
-send e-mail synchronously inside the transaction.
-Problems: (1) lost update => **overselling** under concurrency, (2) the slow HTTP e-mail call holds a DB
-connection, so Hikari's 10 connections are exhausted after ~10 concurrent requests, (3) everything queues on one row.
+Without a verified domain, Resend only delivers from onboarding@resend.dev to the email address used to sign up for Resend.
 
-**Final (`APP_MODE=optimized`)**:
+Run locally
+git clone <repo-url>
+cd event-booking
+# set the environment variables above, then:
+./mvnw spring-boot:run
 
-```sql
-UPDATE events SET available_seats = available_seats - :qty
-WHERE id = :id AND available_seats >= :qty AND status = 'ACTIVE'
-```
+Health check: GET /actuator/health.
 
-0 rows updated => 409 sold out. Check and decrement are one atomic statement, the row lock is held for
-microseconds, and the `CHECK` constraint is a last line of defence. The booking transaction is now
-1 UPDATE + 2 INSERTs and **no external calls**.
-Event updates use `SELECT ... FOR UPDATE` so a stale `available_seats` is never written back over concurrent bookings.
-`Idempotency-Key` (unique column) makes client retries safe.
+Security notes
+Secrets are provided only through environment variables, never committed.
+k6/seed.json, seed-naive.json and seed-opt.json contain valid tokens and are git-ignored.
+SEED_ENABLED must be set to false after testing.
+AI tools
 
-## 6. Background jobs (transactional outbox)
-
-- **Task 1 Booking confirmation:** the booking transaction inserts a `BOOKING_CONFIRMATION` job. Worker sends the real e-mail.
-- **Task 2 Event update:** the update transaction inserts one `EVENT_UPDATED` job. The worker fans it out in a single
-  `INSERT ... SELECT` into one `EVENT_UPDATE_EMAIL` job per distinct booked customer, so each recipient is retried independently.
-- `JobService.enqueue` uses `Propagation.MANDATORY`: it _cannot_ run outside the business transaction.
-  If the booking rolls back, the job disappears; if it commits, the job is guaranteed to exist.
-- Worker: `SELECT ... FOR UPDATE SKIP LOCKED` batch claim, bounded thread pool, `max-in-flight` back-pressure.
-- Failures: exponential backoff 5s, 10s, 20s ... up to 5 attempts, then `FAILED` with `last_error` stored.
-- Crash recovery: a reaper returns jobs stuck in `PROCESSING` > 5 min to `PENDING` (**at-least-once**).
-- Idempotency: `bookings.email_sent` stops duplicate confirmation e-mails on retry.
-- Observability: `SELECT status, count(*) FROM jobs GROUP BY 1;`
-
-E-mail provider: Resend. **Note:** without a verified domain Resend only delivers to the account owner's address
-(sender `onboarding@resend.dev`), so register demo customers with your own e-mail (or verify a domain).
-For stress tests `MAIL_PROVIDER=simulated` (sleeps `MAIL_SIM_LATENCY_MS`) is used, because Resend rate-limits
-(~2 req/s on free) and would hide the app's own limits. This is a deliberate, disclosed decision.
-
-## 7. Performance
-
-### Test setup
-
-- Hardware: `<e.g. Render free: 0.1 CPU / 512 MB>`; DB: `<e.g. Render Postgres free / Neon>`; load generator: `<laptop, region>`
-- Seed: `k6/seed.sh $BASE $SEED_SECRET 1000 1 100000` (1000 customers, 1 event with 100k seats, JWTs pre-generated)
-- Breaking point = first stage where p95 > 1s **or** errors/timeouts/dropped iterations > 1%.
-
-### Results (fill in with real k6 output)
-
-| #   | Version / change                           | Max stable req/s | p95 at that rate | Errors / dropped | Notes               |
-| --- | ------------------------------------------ | ---------------- | ---------------- | ---------------- | ------------------- |
-| 0   | v1 naive (`APP_MODE=naive`, pool 10)       |                  |                  |                  | oversold? Y/N, 503s |
-| 1   | + atomic UPDATE (`APP_MODE=optimized`)     |                  |                  |                  |                     |
-| 2   | + e-mail moved to outbox/worker            |                  |                  |                  |                     |
-| 3   | + Hikari pool tuned (`DB_POOL_SIZE=`)      |                  |                  |                  |                     |
-| 4   | + virtual threads (`VIRTUAL_THREADS=true`) |                  |                  |                  |                     |
-| 5   | + JVM flags / other                        |                  |                  |                  |                     |
-
-Event-update scenario (1000 booked customers): request latency v1 = `__ s`, optimized = `__ ms`;
-time until all notifications delivered = `__ s`:
-
-```sql
-SELECT status, count(*) FROM jobs WHERE type='EVENT_UPDATE_EMAIL' GROUP BY status;
-SELECT min(created_at) AS started, max(finished_at) AS finished, max(finished_at)-min(created_at) AS total
-FROM jobs WHERE type='EVENT_UPDATE_EMAIL';
-```
-
-Oversell check: `SELECT total_seats - available_seats AS decremented, (SELECT coalesce(sum(quantity),0) FROM bookings WHERE event_id=1) AS booked FROM events WHERE id=1;` (they must match; in naive mode they will not).
-
-### Optimization ideas and trade-offs
-
-1. Atomic UPDATE instead of read-modify-write: fixes overselling, shortens lock time.
-2. E-mail off the request path: removes the slow call from the transaction.
-3. Pool sizing: bigger is not better; capped by Postgres connection limit. Measured, not guessed.
-4. Virtual threads: requests blocked on I/O no longer pin platform threads.
-5. Idempotency keys, JWT-only auth, indexed + paginated reads.
-6. **Not done / future work:** hot-row sharding (split seats into N buckets), Redis `DECR` admission gate,
-   `202 Accepted` queue-based booking, Bucket4j rate limiting (graceful 429), read cache for `GET /events`,
-   separate worker deployment, Kafka/RabbitMQ at larger scale.
-
-## 8. Run locally
-
-```bash
-docker run -d --name pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=eventbooking -p 5432:5432 postgres:16
-export SEED_ENABLED=true SEED_SECRET=devsecret APP_MODE=naive
-mvn spring-boot:run
-# Swagger: http://localhost:8080/swagger-ui.html
-```
-
-### Env vars
-
-`DB_URL, DB_USER, DB_PASSWORD, JWT_SECRET (>=32 chars), APP_MODE (naive|optimized), DB_POOL_SIZE, VIRTUAL_THREADS,
-MAIL_PROVIDER (resend|simulated), RESEND_API_KEY, MAIL_FROM, MAIL_SIM_LATENCY_MS, WORKER_THREADS, SEED_ENABLED, SEED_SECRET`
-
-### Load test
-
-```bash
-./k6/seed.sh http://localhost:8080 devsecret 1000 1 100000
-k6 run -e BASE=http://localhost:8080 k6/booking-hot.js
-./k6/seed.sh http://localhost:8080 devsecret 1000 50 1000 && k6 run -e BASE=http://localhost:8080 k6/booking-multi.js
-./k6/seed.sh http://localhost:8080 devsecret 1000 1 100000 && k6 run -e BASE=http://localhost:8080 k6/event-update.js
-```
-
-Tag the baseline so reviewers can reproduce it: `git tag v1-naive` (run with `APP_MODE=naive`) and `git tag v2-optimized`.
-
-## 9. Known limitations
-
-- Seed endpoint is for testing only and is disabled by default (env flag + secret header).
-- Single hot row still serialises writers; fine into the hundreds of bookings/s, beyond that see "future work".
-- At-least-once e-mail delivery: a crash between "sent" and "marked done" can duplicate one e-mail.
-- Free-tier hardware means absolute numbers are small; the _relative_ delta is the point.
-
-## 10. AI usage
-
-Claude was used for planning and scaffolding. I reviewed the code, deliberately kept a naive v1 as a baseline,
-measured it, and then applied and measured each optimization. `<add what you changed yourself>`
+This project was built with AI assistance (initial implementation, load-test scripts and optimization analysis). The design decisions above were reviewed and validated against measured results.
