@@ -1,0 +1,54 @@
+server:
+  port: ${PORT:8080}
+  tomcat:
+    threads:
+      max: ${TOMCAT_MAX_THREADS:200}
+    accept-count: ${TOMCAT_ACCEPT_COUNT:100}
+  compression:
+    enabled: true
+
+spring:
+  application:
+    name: event-booking
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/eventbooking}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10} # Hikari default. Tune after load testing
+      minimum-idle: ${DB_POOL_MIN_IDLE:10}
+      connection-timeout: ${DB_CONN_TIMEOUT_MS:30000}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none # schema is owned by Flyway
+  flyway:
+    enabled: true
+  threads:
+    virtual:
+      enabled: ${VIRTUAL_THREADS:false}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+
+app:
+  mode: ${APP_MODE:optimized} # naive | optimized
+  jwt:
+    secret: ${JWT_SECRET:change-me-change-me-change-me-change-me-1234} # min 32 chars
+    expiry-hours: 24
+  mail:
+    provider: ${MAIL_PROVIDER:simulated} # resend | simulated
+    resend-api-key: ${RESEND_API_KEY:}
+    from: ${MAIL_FROM:onboarding@resend.dev}
+    simulated-latency-ms: ${MAIL_SIM_LATENCY_MS:300}
+  worker:
+    threads: ${WORKER_THREADS:8}
+    max-in-flight: ${WORKER_MAX_IN_FLIGHT:50}
+    max-attempts: ${WORKER_MAX_ATTEMPTS:5}
+    poll-ms: ${WORKER_POLL_MS:200}
+  seed:
+    enabled: ${SEED_ENABLED:false}
+    secret: ${SEED_SECRET:}
